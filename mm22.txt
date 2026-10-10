@@ -1,665 +1,2008 @@
---[[
-    Murderer vs Sheriff FFA — Enhanced Script (Fixed & Stable)
-    Устранены все известные проблемы безопасности и производительности.
---]]
-
-print("[MVS-FIX] START")
-
--- ================= BOOT =================
-if not game:IsLoaded() then
-    pcall(function() game.Loaded:Wait() end)
-end
-pcall(function() task.wait(0.3) end)
-
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local StarterGui = game:GetService("StarterGui")
-local HttpService = game:GetService("HttpService")
-
-local LP = Players.LocalPlayer
-if not LP then
-    pcall(function() Players:GetPropertyChangedSignal("LocalPlayer"):Wait() end)
-    LP = Players.LocalPlayer
-end
-if not LP then
-    warn("[MVS-FIX] Нет LocalPlayer")
-    return
-end
-
-local Camera = workspace.CurrentCamera
-
-local function LOG(msg)
-    pcall(function() print("[MVS-FIX] " .. tostring(msg)) end)
-end
-local function WARN(msg)
-    pcall(function() warn("[MVS-FIX] " .. tostring(msg)) end)
-end
-
--- ================= GUI PARENT =================
-local GuiParent
-do
-    local ok, hui = pcall(function() return gethui() end)
-    if ok and hui then
-        GuiParent = hui
-        LOG("GUI parent: gethui()")
-    else
-        local ok2, cg = pcall(function() return game:GetService("CoreGui") end)
-        if ok2 and cg then
-            GuiParent = cg
-            LOG("GUI parent: CoreGui")
-        else
-            GuiParent = LP:WaitForChild("PlayerGui", 5)
-            LOG("GUI parent: PlayerGui")
-        end
-    end
-end
-if not GuiParent then
-    WARN("Нет родителя для GUI")
-    return
-end
-
-pcall(function()
-    local old = GuiParent:FindFirstChild("MVS_Gui")
-    if old then old:Destroy() end
-end)
-
--- ================= УТИЛИТЫ =================
-local function Notify(title, text)
-    pcall(function()
-        StarterGui:SetCore("SendNotification", {
-            Title = title or "MVS",
-            Text = text or "",
-            Duration = 2.5
-        })
-    end)
-end
-
-local function SafeCall(fn, ...)
-    local args = {...}
-    local ok, err = pcall(function() return fn(table.unpack(args)) end)
-    if not ok then
-        WARN("Callback: " .. tostring(err))
-    end
-    return ok
-end
-
--- ================= КОНФИГ =================
-local Config = {
-    stickTarget = nil,
-    stickDuration = 2,
-
-    aimbotEnabled = false,
-    wallCheck = true,
-    aimTeam = 1,
-    aimSmoothing = 0.35,
-    aimFOV = 400,
-
-    wallbangEnabled = false,
-
-    shiftLockEnabled = false,
-
-    espEnabled = true,
-    espTeam = 1,
-    espColor = Color3.fromRGB(255, 60, 60),
-    espRainbow = false,
-}
-
--- ================= СОХРАНЕНИЕ =================
-local hasFileSystem = false
-pcall(function()
-    if writefile and readfile and isfile then
-        hasFileSystem = true
-    end
-end)
-
-local SETTINGS_FILE = "mvs_fixed_settings.json"
-
-local function saveSettings()
-    if not hasFileSystem then
-        getgenv().MVS_Settings = Config
-        return
-    end
-    pcall(function()
-        local data = {
-            aimbotEnabled = Config.aimbotEnabled,
-            wallCheck = Config.wallCheck,
-            aimTeam = Config.aimTeam,
-            aimSmoothing = Config.aimSmoothing,
-            aimFOV = Config.aimFOV,
-            wallbangEnabled = Config.wallbangEnabled,
-            shiftLockEnabled = Config.shiftLockEnabled,
-            espEnabled = Config.espEnabled,
-            espTeam = Config.espTeam,
-            espRainbow = Config.espRainbow,
-        }
-        writefile(SETTINGS_FILE, HttpService:JSONEncode(data))
-    end)
-end
-
-local function loadSettings()
-    if not hasFileSystem then
-        if getgenv().MVS_Settings then
-            for k, v in pairs(getgenv().MVS_Settings) do
-                if Config[k] ~= nil then Config[k] = v end
-            end
-        end
-        return
-    end
-    pcall(function()
-        if isfile(SETTINGS_FILE) then
-            local raw = readfile(SETTINGS_FILE)
-            local data = HttpService:JSONDecode(raw)
-            for k, v in pairs(data) do
-                if Config[k] ~= nil then Config[k] = v end
-            end
-            LOG("Настройки загружены")
-        end
-    end)
-end
-loadSettings()
-
--- ================= TEAM MANAGER =================
-local teamList = {}
-local teamMap = {}
-
-local function scanTeams()
-    local groups = {}
-    local order = {}
-
-    for _, player in ipairs(Players:GetPlayers()) do
-        local teamName = nil
-        
-        -- 1) Проверяем атрибут "Team" (основной способ)
-        local attr = player:GetAttribute("Team")
-        if attr and attr ~= "" then
-            teamName = tostring(attr)
-        -- 2) Проверяем стандартную команду
-        elseif player.Team then
-            teamName = player.Team.Name
-        -- 3) Проверяем TeamColor
-        elseif player.TeamColor then
-            local c = player.TeamColor.Color
-            local default = Color3.fromRGB(128, 128, 128)
-            if c ~= default then
-                teamName = player.TeamColor.Name
-            end
-        end
-        
-        if teamName then
-            if not groups[teamName] then
-                groups[teamName] = {name = teamName, count = 0}
-                table.insert(order, teamName)
-            end
-            groups[teamName].count = groups[teamName].count + 1
-        end
-    end
-
-    table.sort(order, function(a, b) return groups[a].count > groups[b].count end)
-
-    teamList = {}
-    teamMap = {}
-
-    for i = 1, math.min(2, #order) do
-        local name = order[i]
-        teamList[i] = groups[name]
-        teamMap[name] = i
-    end
-    LOG("Команд найдено: " .. #teamList)
-end
-
-scanTeams()
-
-local function getTeamIndex(player)
-    if not player then return nil end
-
-    local attr = player:GetAttribute("Team")
-    if attr and attr ~= "" then
-        local idx = teamMap[tostring(attr)]
-        if idx then return idx end
-    end
-
-    if player.Team then
-        local idx = teamMap[player.Team.Name]
-        if idx then return idx end
-    end
-
-    if player.TeamColor then
-        local c = player.TeamColor.Color
-        for name, idx in pairs(teamMap) do
-            if name == player.TeamColor.Name then
-                return idx
-            end
-        end
-    end
-    return nil
-end
-
-local function getTeamName(player)
-    if not player then return "?" end
-    local attr = player:GetAttribute("Team")
-    if attr and attr ~= "" then return tostring(attr) end
-    if player.Team then return player.Team.Name end
-    if player.TeamColor then return player.TeamColor.Name end
-    return "?"
-end
-
--- ================= GUI =================
-local Colors = {
-    bg = Color3.fromRGB(22, 22, 28),
-    panel = Color3.fromRGB(40, 40, 50),
-    header = Color3.fromRGB(0, 150, 230),
-    accent = Color3.fromRGB(0, 170, 255),
-    on = Color3.fromRGB(0, 170, 80),
-    off = Color3.fromRGB(45, 45, 55),
-    danger = Color3.fromRGB(180, 60, 60),
-    wallbang = Color3.fromRGB(190, 90, 20),
-    shiftlock = Color3.fromRGB(140, 80, 200),
-    rainbow = Color3.fromRGB(255, 120, 200),
-    text = Color3.fromRGB(235, 235, 235),
-    textDim = Color3.fromRGB(160, 200, 255),
-}
-
-local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "MVS_Gui"
-ScreenGui.ResetOnSpawn = false
-ScreenGui.IgnoreGuiInset = true
-ScreenGui.DisplayOrder = 99999
-pcall(function()
-    if syn and syn.protect_gui then syn.protect_gui(ScreenGui) end
-end)
-ScreenGui.Parent = GuiParent
-
-local function Create(class, props, parent)
-    local inst = Instance.new(class)
-    for k, v in pairs(props) do inst[k] = v end
-    inst.Parent = parent
-    return inst
-end
-
-local function Corner(parent, r)
-    return Create("UICorner", {CornerRadius = UDim.new(0, r or 6)}, parent)
-end
-
-local Main = Create("Frame", {
-    Name = "Main",
-    Size = UDim2.new(0, 340, 0, 360),
-    Position = UDim2.new(0.5, -170, 0.5, -180),
-    BackgroundColor3 = Colors.bg,
-    BorderSizePixel = 0,
-    Active = true,
-    Draggable = true
-}, ScreenGui)
-Corner(Main, 12)
-Create("UIStroke", {Color = Colors.accent, Thickness = 2}, Main)
-
-local TitleBar = Create("Frame", {
-    Size = UDim2.new(1, 0, 0, 34),
-    BackgroundColor3 = Colors.header,
-    BorderSizePixel = 0
-}, Main)
-Corner(TitleBar, 12)
-
-Create("TextLabel", {
-    Size = UDim2.new(1, -80, 1, 0),
-    Position = UDim2.new(0, 12, 0, 0),
-    BackgroundTransparency = 1,
-    Text = "MVS FFA (Fixed)",
-    TextColor3 = Color3.new(1, 1, 1),
-    TextSize = 15,
-    Font = Enum.Font.GothamBold,
-    TextXAlignment = Enum.TextXAlignment.Left
-}, TitleBar)
-
-local MinimizeBtn = Create("TextButton", {
-    Size = UDim2.new(0, 28, 0, 28),
-    Position = UDim2.new(1, -64, 0, 3),
-    BackgroundColor3 = Color3.fromRGB(255, 180, 60),
-    Text = "-",
-    TextColor3 = Color3.new(0, 0, 0),
-    TextSize = 18,
-    Font = Enum.Font.GothamBold
-}, TitleBar)
-Corner(MinimizeBtn, 6)
-
-local CloseBtn = Create("TextButton", {
-    Size = UDim2.new(0, 28, 0, 28),
-    Position = UDim2.new(1, -32, 0, 3),
-    BackgroundColor3 = Color3.fromRGB(240, 70, 70),
-    Text = "X",
-    TextColor3 = Color3.new(1, 1, 1),
-    TextSize = 13,
-    Font = Enum.Font.GothamBold
-}, TitleBar)
-Corner(CloseBtn, 6)
-
-local FloatBtn = Create("TextButton", {
-    Size = UDim2.new(0, 48, 0, 48),
-    Position = UDim2.new(0, 15, 0.5, -24),
-    BackgroundColor3 = Colors.accent,
-    Text = "MVS",
-    TextSize = 14,
-    Font = Enum.Font.GothamBold,
-    TextColor3 = Color3.new(1, 1, 1),
-    Visible = false,
-    Active = true,
-    Draggable = true
-}, ScreenGui)
-Corner(FloatBtn, 50)
-Create("UIStroke", {Color = Color3.new(1, 1, 1), Thickness = 2}, FloatBtn)
-
-MinimizeBtn.MouseButton1Click:Connect(function()
-    Main.Visible = false
-    FloatBtn.Visible = true
-end)
-FloatBtn.MouseButton1Click:Connect(function()
-    Main.Visible = true
-    FloatBtn.Visible = false
-end)
-CloseBtn.MouseButton1Click:Connect(function()
-    saveSettings()
-    pcall(function() ScreenGui:Destroy() end)
-    _G.MVSLoaded = false
-end)
-
-local TabBar = Create("Frame", {
-    Size = UDim2.new(1, -16, 0, 32),
-    Position = UDim2.new(0, 8, 0, 42),
-    BackgroundTransparency = 1
-}, Main)
-Create("UIListLayout", {
-    FillDirection = Enum.FillDirection.Horizontal,
-    Padding = UDim.new(0, 5),
-    SortOrder = Enum.SortOrder.LayoutOrder
-}, TabBar)
-
-local PagesHolder = Create("Frame", {
-    Size = UDim2.new(1, -16, 1, -84),
-    Position = UDim2.new(0, 8, 0, 78),
-    BackgroundTransparency = 1
-}, Main)
-
-local Pages = {}
-local TabButtons = {}
-
-local function CreatePage(order)
-    local sf = Create("ScrollingFrame", {
-        Size = UDim2.new(1, 0, 1, 0),
-        BackgroundTransparency = 1,
-        BorderSizePixel = 0,
-        ScrollBarThickness = 4,
-        ScrollBarImageColor3 = Colors.accent,
-        CanvasSize = UDim2.new(0, 0, 0, 0),
-        AutomaticCanvasSize = Enum.AutomaticSize.Y,
-        LayoutOrder = order,
-        Visible = false
-    }, PagesHolder)
-    Create("UIListLayout", {
-        Padding = UDim.new(0, 6),
-        SortOrder = Enum.SortOrder.LayoutOrder
-    }, sf)
-    return sf
-end
-
-local function CreateTab(name, order, index)
-    local btn = Create("TextButton", {
-        Size = UDim2.new(0.33, -4, 1, 0),
-        BackgroundColor3 = Colors.panel,
-        Text = name,
-        TextColor3 = Color3.fromRGB(220, 220, 220),
-        TextSize = 13,
-        Font = Enum.Font.GothamMedium,
-        LayoutOrder = order
-    }, TabBar)
-    Corner(btn)
-    TabButtons[index] = btn
-end
-
-local function SelectTab(index)
-    for i, p in ipairs(Pages) do
-        p.Visible = (i == index)
-    end
-    for i, b in ipairs(TabButtons) do
-        b.BackgroundColor3 = (i == index) and Colors.accent or Colors.panel
-    end
-end
-
-CreateTab("Murder", 1, 1)
-CreateTab("Sheriff", 2, 2)
-CreateTab("Universal", 3, 3)
-Pages[1] = CreatePage(1)
-Pages[2] = CreatePage(2)
-Pages[3] = CreatePage(3)
-
-TabButtons[1].MouseButton1Click:Connect(function() SelectTab(1) end)
-TabButtons[2].MouseButton1Click:Connect(function() SelectTab(2) end)
-TabButtons[3].MouseButton1Click:Connect(function() SelectTab(3) end)
-SelectTab(1)
-
--- ================= UI HELPERS =================
-local function MakeButton(parent, text, order, callback, color)
-    local btn = Create("TextButton", {
-        Size = UDim2.new(1, 0, 0, 38),
-        BackgroundColor3 = color or Colors.panel,
-        Text = text,
-        TextColor3 = Colors.text,
-        TextSize = 13,
-        Font = Enum.Font.GothamMedium,
-        LayoutOrder = order
-    }, parent)
-    Corner(btn)
-    btn.MouseButton1Click:Connect(function()
-        SafeCall(callback)
-    end)
-    return btn
-end
-
-local function MakeLabel(parent, text, order)
-    return Create("TextLabel", {
-        Size = UDim2.new(1, 0, 0, 20),
-        BackgroundTransparency = 1,
-        Text = text,
-        TextColor3 = Colors.textDim,
-        TextSize = 12,
-        Font = Enum.Font.GothamBold,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        LayoutOrder = order
-    }, parent)
-end
-
-local function PaintToggle(btn, on, label, colorOn)
-    if on then
-        btn.Text = label .. ": ON"
-        btn.BackgroundColor3 = colorOn or Colors.on
-        btn.TextColor3 = Color3.new(1, 1, 1)
-    else
-        btn.Text = label .. ": OFF"
-        btn.BackgroundColor3 = Colors.off
-        btn.TextColor3 = Color3.new(0.75, 0.75, 0.75)
-    end
-end
-
-local function MakeToggle(parent, label, order, getter, setter, colorOn)
-    local btn = MakeButton(parent, label .. ": OFF", order, function()
-        local newState = not getter()
-        setter(newState)
-        PaintToggle(btn, newState, label, colorOn)
-        saveSettings()
-    end)
-    PaintToggle(btn, getter(), label, colorOn)
-    return btn
-end
-
--- ===========================================================
--- ВКЛАДКА 1: MURDER
--- ===========================================================
-local MurderPage = Pages[1]
-
-MakeLabel(MurderPage, "Цель:", 1)
-local TargetLabel = Create("TextLabel", {
-    Size = UDim2.new(1, 0, 0, 28),
-    BackgroundColor3 = Color3.fromRGB(35, 35, 45),
-    Text = "Не выбрана",
-    TextColor3 = Color3.fromRGB(255, 255, 200),
-    TextSize = 12,
-    Font = Enum.Font.GothamMedium,
-    LayoutOrder = 2
-}, MurderPage)
-Corner(TargetLabel)
-
-MakeLabel(MurderPage, "Игроки:", 3)
-
-local PlayerListFrame = Create("Frame", {
-    Size = UDim2.new(1, 0, 0, 160),
-    BackgroundColor3 = Color3.fromRGB(18, 18, 24),
-    LayoutOrder = 4
-}, MurderPage)
-Corner(PlayerListFrame)
-
-local PlayerScroll = Create("ScrollingFrame", {
-    Size = UDim2.new(1, -8, 1, -8),
-    Position = UDim2.new(0, 4, 0, 4),
-    BackgroundTransparency = 1,
-    BorderSizePixel = 0,
-    ScrollBarThickness = 4,
-    ScrollBarImageColor3 = Colors.accent,
-    CanvasSize = UDim2.new(0, 0, 0, 0),
-    AutomaticCanvasSize = Enum.AutomaticSize.Y
-}, PlayerListFrame)
-Create("UIListLayout", {
-    Padding = UDim.new(0, 3),
-    SortOrder = Enum.SortOrder.LayoutOrder
-}, PlayerScroll)
-
-local playerRows = {}
-
-local function buildPlayerList()
-    for _, child in ipairs(PlayerScroll:GetChildren()) do
-        if child:IsA("TextButton") then child:Destroy() end
-    end
-    playerRows = {}
-
-    local i = 0
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LP then
-            i = i + 1
-            local btn = Create("TextButton", {
-                Size = UDim2.new(1, -6, 0, 32),
-                BackgroundColor3 = Colors.panel,
-                Text = "",
-                TextColor3 = Colors.text,
-                TextSize = 11,
-                Font = Enum.Font.GothamMedium,
-                TextXAlignment = Enum.TextXAlignment.Left,
-                LayoutOrder = i
-            }, PlayerScroll)
-            Corner(btn, 5)
-            playerRows[player] = btn
-
-            btn.MouseButton1Click:Connect(function()
-                Config.stickTarget = player
-                local idx = getTeamIndex(player)
-                local bd = idx and ("T" .. idx) or "?"
-                TargetLabel.Text = player.Name .. " [" .. bd .. "] " .. getTeamName(player)
-                Notify("Цель выбрана", player.Name)
-            end)
-        end
-    end
-
-    for player, btn in pairs(playerRows) do
-        if btn and btn.Parent then
-            local idx = getTeamIndex(player)
-            local bd = idx and ("T" .. idx) or "?"
-            btn.Text = "  " .. player.Name .. "  [" .. bd .. "] " .. getTeamName(player)
-        end
-    end
-end
-
-buildPlayerList()
-
-task.spawn(function()
-    while ScreenGui.Parent do
-        task.wait(2)
-        pcall(function()
-            local cnt = 0
-            for player, _ in pairs(playerRows) do
-                if player.Parent and player ~= LP then cnt = cnt + 1 end
-            end
-            if cnt ~= #Players:GetPlayers() - 1 then
-                buildPlayerList()
-                return
-            end
-            for player, btn in pairs(playerRows) do
-                if btn and btn.Parent then
-                    local idx = getTeamIndex(player)
-                    local bd = idx and ("T" .. idx) or "?"
-                    btn.Text = "  " .. player.Name .. "  [" .. bd .. "] " .. getTeamName(player)
-                end
-            end
-        end)
-    end
-end)
-
-Players.PlayerAdded:Connect(function() task.wait(0.5) buildPlayerList() end)
-Players.PlayerRemoving:Connect(function() task.wait(0.5) buildPlayerList() end)
-
-local stickState = {active = false, connection = nil}
-
-local function stopStick()
-    if stickState.connection then
-        pcall(function() stickState.connection:Disconnect() end)
-        stickState.connection = nil
-    end
-    stickState.active = false
-    local char = LP.Character
-    if char then
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        if hum then pcall(function() hum.PlatformStand = false end) end
-        for _, part in ipairs(char:GetDescendants()) do
-            if part:IsA("BasePart") then
-                pcall(function() part.CanCollide = true end)
-            end
-        end
-    end
-end
-
-local stickBtn = MakeButton(MurderPage, "Прилипание (2с): OFF", 5, function()
-    if stickState.active then
-        stopStick()
-        PaintToggle(stickBtn, false, "Прилипание (2с)", Colors.danger)
-        return
-    end
-    local target = Config.stickTarget
-    if not target or not target.Parent then
-        Notify("Ошибка", "Выбери игрока")
-        return
-    end
-    local myChar = LP.Character
-    if not myChar then return end
-    local myHRP = myChar:FindFirstChild("HumanoidRootPart")
-    if not myHRP then return end
-    local myHum = myChar:FindFirstChildOfClass("Humanoid")
-
-    for _, part in ipairs(myChar:GetDescendants()) do
-        if part:IsA("BasePart") and part.CanCollide then
-            part.CanCollide = false
-        end
-    end
-    if myHum then pcall(function() myHum.PlatformStand = true end) end
-
-    local startTime = tick()
-    stickState.active = true
-    stickState.connection = RunService.RenderStepped:Connect(function()
-        pcall(function()
-            local tChar = target.Character
-            if not tChar then stopStick() return end
-            local tHRP = tChar:FindFirstChild("HumanoidRootPart")
-            if not tHRP then stopStick() return end
-            myHRP.CFrame = tHRP.CFrame * CFrame.new(0, 0, 2)
-            myHRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-            if tick() - startTime >= Config.stickDuration then
-                stopStick()
-                PaintToggle(stickBtn, false, "Прилипание (2с)", Colors.danger)
-            end
-        end)
-    en
+--[[
+
+    Murderer vs Sheriff FFA — Enhanced Script (Fixed & Stable)
+
+    Устранены все известные проблемы безопасности и производительности.
+
+--]]
+
+
+
+print("[MVS-FIX] START")
+
+
+
+-- ================= BOOT =================
+
+if not game:IsLoaded() then
+
+    pcall(function() game.Loaded:Wait() end)
+
+end
+
+pcall(function() task.wait(0.3) end)
+
+
+
+local Players = game:GetService("Players")
+
+local RunService = game:GetService("RunService")
+
+local UserInputService = game:GetService("UserInputService")
+
+local StarterGui = game:GetService("StarterGui")
+
+local HttpService = game:GetService("HttpService")
+
+
+
+local LP = Players.LocalPlayer
+
+if not LP then
+
+    pcall(function() Players:GetPropertyChangedSignal("LocalPlayer"):Wait() end)
+
+    LP = Players.LocalPlayer
+
+end
+
+if not LP then
+
+    warn("[MVS-FIX] Нет LocalPlayer")
+
+    return
+
+end
+
+
+
+local Camera = workspace.CurrentCamera
+
+
+
+local function LOG(msg)
+
+    pcall(function() print("[MVS-FIX] " .. tostring(msg)) end)
+
+end
+
+local function WARN(msg)
+
+    pcall(function() warn("[MVS-FIX] " .. tostring(msg)) end)
+
+end
+
+
+
+-- ================= GUI PARENT =================
+
+local GuiParent
+
+do
+
+    local ok, hui = pcall(function() return gethui() end)
+
+    if ok and hui then
+
+        GuiParent = hui
+
+        LOG("GUI parent: gethui()")
+
+    else
+
+        local ok2, cg = pcall(function() return game:GetService("CoreGui") end)
+
+        if ok2 and cg then
+
+            GuiParent = cg
+
+            LOG("GUI parent: CoreGui")
+
+        else
+
+            GuiParent = LP:WaitForChild("PlayerGui", 5)
+
+            LOG("GUI parent: PlayerGui")
+
+        end
+
+    end
+
+end
+
+if not GuiParent then
+
+    WARN("Нет родителя для GUI")
+
+    return
+
+end
+
+
+
+pcall(function()
+
+    local old = GuiParent:FindFirstChild("MVS_Gui")
+
+    if old then old:Destroy() end
+
+end)
+
+
+
+-- ================= УТИЛИТЫ =================
+
+local function Notify(title, text)
+
+    pcall(function()
+
+        StarterGui:SetCore("SendNotification", {
+
+            Title = title or "MVS",
+
+            Text = text or "",
+
+            Duration = 2.5
+
+        })
+
+    end)
+
+end
+
+
+
+local function SafeCall(fn, ...)
+
+    local args = {...}
+
+    local ok, err = pcall(function() return fn(table.unpack(args)) end)
+
+    if not ok then
+
+        WARN("Callback: " .. tostring(err))
+
+    end
+
+    return ok
+
+end
+
+
+
+-- ================= КОНФИГ =================
+
+local Config = {
+
+    stickTarget = nil,
+
+    stickDuration = 2,
+
+
+
+    aimbotEnabled = false,
+
+    wallCheck = true,
+
+    aimTeam = 1,
+
+    aimSmoothing = 0.35,
+
+    aimFOV = 400,
+
+
+
+    wallbangEnabled = false,
+
+
+
+    shiftLockEnabled = false,
+
+
+
+    espEnabled = true,
+
+    espTeam = 1,
+
+    espColor = Color3.fromRGB(255, 60, 60),
+
+    espRainbow = false,
+
+}
+
+
+
+-- ================= СОХРАНЕНИЕ =================
+
+local hasFileSystem = false
+
+pcall(function()
+
+    if writefile and readfile and isfile then
+
+        hasFileSystem = true
+
+    end
+
+end)
+
+
+
+local SETTINGS_FILE = "mvs_fixed_settings.json"
+
+
+
+local function saveSettings()
+
+    if not hasFileSystem then
+
+        getgenv().MVS_Settings = Config
+
+        return
+
+    end
+
+    pcall(function()
+
+        local data = {
+
+            aimbotEnabled = Config.aimbotEnabled,
+
+            wallCheck = Config.wallCheck,
+
+            aimTeam = Config.aimTeam,
+
+            aimSmoothing = Config.aimSmoothing,
+
+            aimFOV = Config.aimFOV,
+
+            wallbangEnabled = Config.wallbangEnabled,
+
+            shiftLockEnabled = Config.shiftLockEnabled,
+
+            espEnabled = Config.espEnabled,
+
+            espTeam = Config.espTeam,
+
+            espRainbow = Config.espRainbow,
+
+        }
+
+        writefile(SETTINGS_FILE, HttpService:JSONEncode(data))
+
+    end)
+
+end
+
+
+
+local function loadSettings()
+
+    if not hasFileSystem then
+
+        if getgenv().MVS_Settings then
+
+            for k, v in pairs(getgenv().MVS_Settings) do
+
+                if Config[k] ~= nil then Config[k] = v end
+
+            end
+
+        end
+
+        return
+
+    end
+
+    pcall(function()
+
+        if isfile(SETTINGS_FILE) then
+
+            local raw = readfile(SETTINGS_FILE)
+
+            local data = HttpService:JSONDecode(raw)
+
+            for k, v in pairs(data) do
+
+                if Config[k] ~= nil then Config[k] = v end
+
+            end
+
+            LOG("Настройки загружены")
+
+        end
+
+    end)
+
+end
+
+loadSettings()
+
+
+
+-- ================= TEAM MANAGER =================
+
+local teamList = {}
+
+local teamMap = {}
+
+
+
+local function scanTeams()
+
+    local groups = {}
+
+    local order = {}
+
+
+
+    for _, player in ipairs(Players:GetPlayers()) do
+
+        local teamName = nil
+
+        
+
+        -- 1) Проверяем атрибут "Team" (основной способ)
+
+        local attr = player:GetAttribute("Team")
+
+        if attr and attr ~= "" then
+
+            teamName = tostring(attr)
+
+        -- 2) Проверяем стандартную команду
+
+        elseif player.Team then
+
+            teamName = player.Team.Name
+
+        -- 3) Проверяем TeamColor
+
+        elseif player.TeamColor then
+
+            local c = player.TeamColor.Color
+
+            local default = Color3.fromRGB(128, 128, 128)
+
+            if c ~= default then
+
+                teamName = player.TeamColor.Name
+
+            end
+
+        end
+
+        
+
+        if teamName then
+
+            if not groups[teamName] then
+
+                groups[teamName] = {name = teamName, count = 0}
+
+                table.insert(order, teamName)
+
+            end
+
+            groups[teamName].count = groups[teamName].count + 1
+
+        end
+
+    end
+
+
+
+    table.sort(order, function(a, b) return groups[a].count > groups[b].count end)
+
+
+
+    teamList = {}
+
+    teamMap = {}
+
+
+
+    for i = 1, math.min(2, #order) do
+
+        local name = order[i]
+
+        teamList[i] = groups[name]
+
+        teamMap[name] = i
+
+    end
+
+    LOG("Команд найдено: " .. #teamList)
+
+end
+
+
+
+scanTeams()
+
+
+
+local function getTeamIndex(player)
+
+    if not player then return nil end
+
+
+
+    local attr = player:GetAttribute("Team")
+
+    if attr and attr ~= "" then
+
+        local idx = teamMap[tostring(attr)]
+
+        if idx then return idx end
+
+    end
+
+
+
+    if player.Team then
+
+        local idx = teamMap[player.Team.Name]
+
+        if idx then return idx end
+
+    end
+
+
+
+    if player.TeamColor then
+
+        local c = player.TeamColor.Color
+
+        for name, idx in pairs(teamMap) do
+
+            if name == player.TeamColor.Name then
+
+                return idx
+
+            end
+
+        end
+
+    end
+
+    return nil
+
+end
+
+
+
+local function getTeamName(player)
+
+    if not player then return "?" end
+
+    local attr = player:GetAttribute("Team")
+
+    if attr and attr ~= "" then return tostring(attr) end
+
+    if player.Team then return player.Team.Name end
+
+    if player.TeamColor then return player.TeamColor.Name end
+
+    return "?"
+
+end
+
+
+
+-- ================= GUI =================
+
+local Colors = {
+
+    bg = Color3.fromRGB(22, 22, 28),
+
+    panel = Color3.fromRGB(40, 40, 50),
+
+    header = Color3.fromRGB(0, 150, 230),
+
+    accent = Color3.fromRGB(0, 170, 255),
+
+    on = Color3.fromRGB(0, 170, 80),
+
+    off = Color3.fromRGB(45, 45, 55),
+
+    danger = Color3.fromRGB(180, 60, 60),
+
+    wallbang = Color3.fromRGB(190, 90, 20),
+
+    shiftlock = Color3.fromRGB(140, 80, 200),
+
+    rainbow = Color3.fromRGB(255, 120, 200),
+
+    text = Color3.fromRGB(235, 235, 235),
+
+    textDim = Color3.fromRGB(160, 200, 255),
+
+}
+
+
+
+local ScreenGui = Instance.new("ScreenGui")
+
+ScreenGui.Name = "MVS_Gui"
+
+ScreenGui.ResetOnSpawn = false
+
+ScreenGui.IgnoreGuiInset = true
+
+ScreenGui.DisplayOrder = 99999
+
+pcall(function()
+
+    if syn and syn.protect_gui then syn.protect_gui(ScreenGui) end
+
+end)
+
+ScreenGui.Parent = GuiParent
+
+
+
+local function Create(class, props, parent)
+
+    local inst = Instance.new(class)
+
+    for k, v in pairs(props) do inst[k] = v end
+
+    inst.Parent = parent
+
+    return inst
+
+end
+
+
+
+local function Corner(parent, r)
+
+    return Create("UICorner", {CornerRadius = UDim.new(0, r or 6)}, parent)
+
+end
+
+
+
+local Main = Create("Frame", {
+
+    Name = "Main",
+
+    Size = UDim2.new(0, 340, 0, 360),
+
+    Position = UDim2.new(0.5, -170, 0.5, -180),
+
+    BackgroundColor3 = Colors.bg,
+
+    BorderSizePixel = 0,
+
+    Active = true,
+
+    Draggable = true
+
+}, ScreenGui)
+
+Corner(Main, 12)
+
+Create("UIStroke", {Color = Colors.accent, Thickness = 2}, Main)
+
+
+
+local TitleBar = Create("Frame", {
+
+    Size = UDim2.new(1, 0, 0, 34),
+
+    BackgroundColor3 = Colors.header,
+
+    BorderSizePixel = 0
+
+}, Main)
+
+Corner(TitleBar, 12)
+
+
+
+Create("TextLabel", {
+
+    Size = UDim2.new(1, -80, 1, 0),
+
+    Position = UDim2.new(0, 12, 0, 0),
+
+    BackgroundTransparency = 1,
+
+    Text = "MVS FFA (Fixed)",
+
+    TextColor3 = Color3.new(1, 1, 1),
+
+    TextSize = 15,
+
+    Font = Enum.Font.GothamBold,
+
+    TextXAlignment = Enum.TextXAlignment.Left
+
+}, TitleBar)
+
+
+
+local MinimizeBtn = Create("TextButton", {
+
+    Size = UDim2.new(0, 28, 0, 28),
+
+    Position = UDim2.new(1, -64, 0, 3),
+
+    BackgroundColor3 = Color3.fromRGB(255, 180, 60),
+
+    Text = "-",
+
+    TextColor3 = Color3.new(0, 0, 0),
+
+    TextSize = 18,
+
+    Font = Enum.Font.GothamBold
+
+}, TitleBar)
+
+Corner(MinimizeBtn, 6)
+
+
+
+local CloseBtn = Create("TextButton", {
+
+    Size = UDim2.new(0, 28, 0, 28),
+
+    Position = UDim2.new(1, -32, 0, 3),
+
+    BackgroundColor3 = Color3.fromRGB(240, 70, 70),
+
+    Text = "X",
+
+    TextColor3 = Color3.new(1, 1, 1),
+
+    TextSize = 13,
+
+    Font = Enum.Font.GothamBold
+
+}, TitleBar)
+
+Corner(CloseBtn, 6)
+
+
+
+local FloatBtn = Create("TextButton", {
+
+    Size = UDim2.new(0, 48, 0, 48),
+
+    Position = UDim2.new(0, 15, 0.5, -24),
+
+    BackgroundColor3 = Colors.accent,
+
+    Text = "MVS",
+
+    TextSize = 14,
+
+    Font = Enum.Font.GothamBold,
+
+    TextColor3 = Color3.new(1, 1, 1),
+
+    Visible = false,
+
+    Active = true,
+
+    Draggable = true
+
+}, ScreenGui)
+
+Corner(FloatBtn, 50)
+
+Create("UIStroke", {Color = Color3.new(1, 1, 1), Thickness = 2}, FloatBtn)
+
+
+
+MinimizeBtn.MouseButton1Click:Connect(function()
+
+    Main.Visible = false
+
+    FloatBtn.Visible = true
+
+end)
+
+FloatBtn.MouseButton1Click:Connect(function()
+
+    Main.Visible = true
+
+    FloatBtn.Visible = false
+
+end)
+
+CloseBtn.MouseButton1Click:Connect(function()
+
+    saveSettings()
+
+    pcall(function() ScreenGui:Destroy() end)
+
+    _G.MVSLoaded = false
+
+end)
+
+
+
+local TabBar = Create("Frame", {
+
+    Size = UDim2.new(1, -16, 0, 32),
+
+    Position = UDim2.new(0, 8, 0, 42),
+
+    BackgroundTransparency = 1
+
+}, Main)
+
+Create("UIListLayout", {
+
+    FillDirection = Enum.FillDirection.Horizontal,
+
+    Padding = UDim.new(0, 5),
+
+    SortOrder = Enum.SortOrder.LayoutOrder
+
+}, TabBar)
+
+
+
+local PagesHolder = Create("Frame", {
+
+    Size = UDim2.new(1, -16, 1, -84),
+
+    Position = UDim2.new(0, 8, 0, 78),
+
+    BackgroundTransparency = 1
+
+}, Main)
+
+
+
+local Pages = {}
+
+local TabButtons = {}
+
+
+
+local function CreatePage(order)
+
+    local sf = Create("ScrollingFrame", {
+
+        Size = UDim2.new(1, 0, 1, 0),
+
+        BackgroundTransparency = 1,
+
+        BorderSizePixel = 0,
+
+        ScrollBarThickness = 4,
+
+        ScrollBarImageColor3 = Colors.accent,
+
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+
+        LayoutOrder = order,
+
+        Visible = false
+
+    }, PagesHolder)
+
+    Create("UIListLayout", {
+
+        Padding = UDim.new(0, 6),
+
+        SortOrder = Enum.SortOrder.LayoutOrder
+
+    }, sf)
+
+    return sf
+
+end
+
+
+
+local function CreateTab(name, order, index)
+
+    local btn = Create("TextButton", {
+
+        Size = UDim2.new(0.33, -4, 1, 0),
+
+        BackgroundColor3 = Colors.panel,
+
+        Text = name,
+
+        TextColor3 = Color3.fromRGB(220, 220, 220),
+
+        TextSize = 13,
+
+        Font = Enum.Font.GothamMedium,
+
+        LayoutOrder = order
+
+    }, TabBar)
+
+    Corner(btn)
+
+    TabButtons[index] = btn
+
+end
+
+
+
+local function SelectTab(index)
+
+    for i, p in ipairs(Pages) do
+
+        p.Visible = (i == index)
+
+    end
+
+    for i, b in ipairs(TabButtons) do
+
+        b.BackgroundColor3 = (i == index) and Colors.accent or Colors.panel
+
+    end
+
+end
+
+
+
+CreateTab("Murder", 1, 1)
+
+CreateTab("Sheriff", 2, 2)
+
+CreateTab("Universal", 3, 3)
+
+Pages[1] = CreatePage(1)
+
+Pages[2] = CreatePage(2)
+
+Pages[3] = CreatePage(3)
+
+
+
+TabButtons[1].MouseButton1Click:Connect(function() SelectTab(1) end)
+
+TabButtons[2].MouseButton1Click:Connect(function() SelectTab(2) end)
+
+TabButtons[3].MouseButton1Click:Connect(function() SelectTab(3) end)
+
+SelectTab(1)
+
+
+
+-- ================= UI HELPERS =================
+
+local function MakeButton(parent, text, order, callback, color)
+
+    local btn = Create("TextButton", {
+
+        Size = UDim2.new(1, 0, 0, 38),
+
+        BackgroundColor3 = color or Colors.panel,
+
+        Text = text,
+
+        TextColor3 = Colors.text,
+
+        TextSize = 13,
+
+        Font = Enum.Font.GothamMedium,
+
+        LayoutOrder = order
+
+    }, parent)
+
+    Corner(btn)
+
+    btn.MouseButton1Click:Connect(function()
+
+        SafeCall(callback)
+
+    end)
+
+    return btn
+
+end
+
+
+
+local function MakeLabel(parent, text, order)
+
+    return Create("TextLabel", {
+
+        Size = UDim2.new(1, 0, 0, 20),
+
+        BackgroundTransparency = 1,
+
+        Text = text,
+
+        TextColor3 = Colors.textDim,
+
+        TextSize = 12,
+
+        Font = Enum.Font.GothamBold,
+
+        TextXAlignment = Enum.TextXAlignment.Left,
+
+        LayoutOrder = order
+
+    }, parent)
+
+end
+
+
+
+local function PaintToggle(btn, on, label, colorOn)
+
+    if on then
+
+        btn.Text = label .. ": ON"
+
+        btn.BackgroundColor3 = colorOn or Colors.on
+
+        btn.TextColor3 = Color3.new(1, 1, 1)
+
+    else
+
+        btn.Text = label .. ": OFF"
+
+        btn.BackgroundColor3 = Colors.off
+
+        btn.TextColor3 = Color3.new(0.75, 0.75, 0.75)
+
+    end
+
+end
+
+
+
+local function MakeToggle(parent, label, order, getter, setter, colorOn)
+
+    local btn = MakeButton(parent, label .. ": OFF", order, function()
+
+        local newState = not getter()
+
+        setter(newState)
+
+        PaintToggle(btn, newState, label, colorOn)
+
+        saveSettings()
+
+    end)
+
+    PaintToggle(btn, getter(), label, colorOn)
+
+    return btn
+
+end
+
+
+
+-- ===========================================================
+
+-- ВКЛАДКА 1: MURDER
+
+-- ===========================================================
+
+local MurderPage = Pages[1]
+
+
+
+MakeLabel(MurderPage, "Цель:", 1)
+
+local TargetLabel = Create("TextLabel", {
+
+    Size = UDim2.new(1, 0, 0, 28),
+
+    BackgroundColor3 = Color3.fromRGB(35, 35, 45),
+
+    Text = "Не выбрана",
+
+    TextColor3 = Color3.fromRGB(255, 255, 200),
+
+    TextSize = 12,
+
+    Font = Enum.Font.GothamMedium,
+
+    LayoutOrder = 2
+
+}, MurderPage)
+
+Corner(TargetLabel)
+
+
+
+MakeLabel(MurderPage, "Игроки:", 3)
+
+
+
+local PlayerListFrame = Create("Frame", {
+
+    Size = UDim2.new(1, 0, 0, 160),
+
+    BackgroundColor3 = Color3.fromRGB(18, 18, 24),
+
+    LayoutOrder = 4
+
+}, MurderPage)
+
+Corner(PlayerListFrame)
+
+
+
+local PlayerScroll = Create("ScrollingFrame", {
+
+    Size = UDim2.new(1, -8, 1, -8),
+
+    Position = UDim2.new(0, 4, 0, 4),
+
+    BackgroundTransparency = 1,
+
+    BorderSizePixel = 0,
+
+    ScrollBarThickness = 4,
+
+    ScrollBarImageColor3 = Colors.accent,
+
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+
+    AutomaticCanvasSize = Enum.AutomaticSize.Y
+
+}, PlayerListFrame)
+
+Create("UIListLayout", {
+
+    Padding = UDim.new(0, 3),
+
+    SortOrder = Enum.SortOrder.LayoutOrder
+
+}, PlayerScroll)
+
+
+
+local playerRows = {}
+
+
+
+local function buildPlayerList()
+
+    for _, child in ipairs(PlayerScroll:GetChildren()) do
+
+        if child:IsA("TextButton") then child:Destroy() end
+
+    end
+
+    playerRows = {}
+
+
+
+    local i = 0
+
+    for _, player in ipairs(Players:GetPlayers()) do
+
+        if player ~= LP then
+
+            i = i + 1
+
+            local btn = Create("TextButton", {
+
+                Size = UDim2.new(1, -6, 0, 32),
+
+                BackgroundColor3 = Colors.panel,
+
+                Text = "",
+
+                TextColor3 = Colors.text,
+
+                TextSize = 11,
+
+                Font = Enum.Font.GothamMedium,
+
+                TextXAlignment = Enum.TextXAlignment.Left,
+
+                LayoutOrder = i
+
+            }, PlayerScroll)
+
+            Corner(btn, 5)
+
+            playerRows[player] = btn
+
+
+
+            btn.MouseButton1Click:Connect(function()
+
+                Config.stickTarget = player
+
+                local idx = getTeamIndex(player)
+
+                local bd = idx and ("T" .. idx) or "?"
+
+                TargetLabel.Text = player.Name .. " [" .. bd .. "] " .. getTeamName(player)
+
+                Notify("Цель выбрана", player.Name)
+
+            end)
+
+        end
+
+    end
+
+
+
+    for player, btn in pairs(playerRows) do
+
+        if btn and btn.Parent then
+
+            local idx = getTeamIndex(player)
+
+            local bd = idx and ("T" .. idx) or "?"
+
+            btn.Text = "  " .. player.Name .. "  [" .. bd .. "] " .. getTeamName(player)
+
+        end
+
+    end
+
+end
+
+
+
+buildPlayerList()
+
+
+
+task.spawn(function()
+
+    while ScreenGui.Parent do
+
+        task.wait(2)
+
+        pcall(function()
+
+            local cnt = 0
+
+            for player, _ in pairs(playerRows) do
+
+                if player.Parent and player ~= LP then cnt = cnt + 1 end
+
+            end
+
+            if cnt ~= #Players:GetPlayers() - 1 then
+
+                buildPlayerList()
+
+                return
+
+            end
+
+            for player, btn in pairs(playerRows) do
+
+                if btn and btn.Parent then
+
+                    local idx = getTeamIndex(player)
+
+                    local bd = idx and ("T" .. idx) or "?"
+
+                    btn.Text = "  " .. player.Name .. "  [" .. bd .. "] " .. getTeamName(player)
+
+                end
+
+            end
+
+        end)
+
+    end
+
+end)
+
+
+
+Players.PlayerAdded:Connect(function() task.wait(0.5) buildPlayerList() end)
+
+Players.PlayerRemoving:Connect(function() task.wait(0.5) buildPlayerList() end)
+
+
+
+local stickState = {active = false, connection = nil}
+
+
+
+local function stopStick()
+
+    if stickState.connection then
+
+        pcall(function() stickState.connection:Disconnect() end)
+
+        stickState.connection = nil
+
+    end
+
+    stickState.active = false
+
+    local char = LP.Character
+
+    if char then
+
+        local hum = char:FindFirstChildOfClass("Humanoid")
+
+        if hum then pcall(function() hum.PlatformStand = false end) end
+
+        for _, part in ipairs(char:GetDescendants()) do
+
+            if part:IsA("BasePart") then
+
+                pcall(function() part.CanCollide = true end)
+
+            end
+
+        end
+
+    end
+
+end
+
+
+
+local stickBtn = MakeButton(MurderPage, "Прилипание (2с): OFF", 5, function()
+
+    if stickState.active then
+
+        stopStick()
+
+        PaintToggle(stickBtn, false, "Прилипание (2с)", Colors.danger)
+
+        return
+
+    end
+
+    local target = Config.stickTarget
+
+    if not target or not target.Parent then
+
+        Notify("Ошибка", "Выбери игрока")
+
+        return
+
+    end
+
+    local myChar = LP.Character
+
+    if not myChar then return end
+
+    local myHRP = myChar:FindFirstChild("HumanoidRootPart")
+
+    if not myHRP then return end
+
+    local myHum = myChar:FindFirstChildOfClass("Humanoid")
+
+
+
+    for _, part in ipairs(myChar:GetDescendants()) do
+
+        if part:IsA("BasePart") and part.CanCollide then
+
+            part.CanCollide = false
+
+        end
+
+    end
+
+    if myHum then pcall(function() myHum.PlatformStand = true end) end
+
+
+
+    local startTime = tick()
+
+    stickState.active = true
+
+    stickState.connection = RunService.RenderStepped:Connect(function()
+
+        pcall(function()
+
+            local tChar = target.Character
+
+            if not tChar then stopStick() return end
+
+            local tHRP = tChar:FindFirstChild("HumanoidRootPart")
+
+            if not tHRP then stopStick() return end
+
+            myHRP.CFrame = tHRP.CFrame * CFrame.new(0, 0, 2)
+
+            myHRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+
+            if tick() - startTime >= Config.stickDuration then
+
+                stopStick()
+
+                PaintToggle(stickBtn, false, "Прилипание (2с)", Colors.danger)
+
+            end
+
+        end)
+
+                end)
+        end)
+    end)
+    PaintToggle(stickBtn, true, "Прилипание (2с)", Colors.danger)
+end, Colors.danger)
+
+-- ===========================================================
+-- ВКЛАДКА 2: SHERIFF
+-- ===========================================================
+local SheriffPage = Pages[2]
+
+MakeLabel(SheriffPage, "Команда для наводки:", 1)
+
+local aimTeamHolder = Create("Frame", {
+    Size = UDim2.new(1, 0, 0, 34),
+    BackgroundTransparency = 1,
+    LayoutOrder = 2
+}, SheriffPage)
+Create("UIListLayout", {
+    FillDirection = Enum.FillDirection.Horizontal,
+    Padding = UDim.new(0, 6)
+}, aimTeamHolder)
+
+local aimT1 = Create("TextButton", {
+    Size = UDim2.new(0.5, -3, 1, 0),
+    Text = "Team 1",
+    TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.GothamBold,
+    TextSize = 13
+}, aimTeamHolder)
+Corner(aimT1)
+
+local aimT2 = Create("TextButton", {
+    Size = UDim2.new(0.5, -3, 1, 0),
+    Text = "Team 2",
+    TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.GothamBold,
+    TextSize = 13
+}, aimTeamHolder)
+Corner(aimT2)
+
+local function refreshAimTeam(s)
+    Config.aimTeam = s
+    aimT1.BackgroundColor3 = (s == 1) and Colors.accent or Color3.fromRGB(50, 50, 60)
+    aimT2.BackgroundColor3 = (s == 2) and Colors.accent or Color3.fromRGB(50, 50, 60)
+end
+aimT1.MouseButton1Click:Connect(function() refreshAimTeam(1) end)
+aimT2.MouseButton1Click:Connect(function() refreshAimTeam(2) end)
+refreshAimTeam(Config.aimTeam or 1)
+
+local aimBtn = MakeToggle(SheriffPage, "Aimbot", 3,
+    function() return Config.aimbotEnabled end,
+    function(v) Config.aimbotEnabled = v end
+)
+
+local wallBtn = MakeToggle(SheriffPage, "Проверка стен", 4,
+    function() return Config.wallCheck end,
+    function(v) Config.wallCheck = v end,
+    Colors.on
+)
+
+local wbBtn = MakeToggle(SheriffPage, "WALLBANG", 5,
+    function() return Config.wallbangEnabled end,
+    function(v) Config.wallbangEnabled = v end,
+    Colors.wallbang
+)
+
+local slBtn = MakeToggle(SheriffPage, "Прямые пули", 6,
+    function() return Config.shiftLockEnabled end,
+    function(v) Config.shiftLockEnabled = v end,
+    Colors.shiftlock
+)
+
+MakeLabel(SheriffPage, "Плавность:", 7)
+local smoothHolder = Create("Frame", {
+    Size = UDim2.new(1, 0, 0, 32),
+    BackgroundTransparency = 1,
+    LayoutOrder = 8
+}, SheriffPage)
+Create("UIListLayout", {
+    FillDirection = Enum.FillDirection.Horizontal,
+    Padding = UDim.new(0, 5)
+}, smoothHolder)
+
+local smoothModes = {
+    {name = "Резко", value = 1.0},
+    {name = "Средне", value = 0.35},
+    {name = "Плавно", value = 0.15}
+}
+local smoothButtons = {}
+for i, mode in ipairs(smoothModes) do
+    local b = Create("TextButton", {
+        Size = UDim2.new(0.33, -3, 1, 0),
+        BackgroundColor3 = (mode.value == Config.aimSmoothing) and Colors.accent or Colors.panel,
+        Text = mode.name,
+        TextColor3 = Colors.text,
+        TextSize = 12,
+        Font = Enum.Font.GothamMedium
+    }, smoothHolder)
+    Corner(b, 5)
+    smoothButtons[i] = b
+    b.MouseButton1Click:Connect(function()
+        Config.aimSmoothing = mode.value
+        for j, btn in ipairs(smoothButtons) do
+            btn.BackgroundColor3 = (j == i) and Colors.accent or Colors.panel
+        end
+        saveSettings()
+    end)
+end
+
+MakeLabel(SheriffPage, "FOV (радиус):", 9)
+local fovHolder = Create("Frame", {
+    Size = UDim2.new(1, 0, 0, 32),
+    BackgroundTransparency = 1,
+    LayoutOrder = 10
+}, SheriffPage)
+Create("UIListLayout", {
+    FillDirection = Enum.FillDirection.Horizontal,
+    Padding = UDim.new(0, 4)
+}, fovHolder)
+
+local fovOptions = {200, 300, 400, 600}
+local fovButtons = {}
+for i, fov in ipairs(fovOptions) do
+    local b = Create("TextButton", {
+        Size = UDim2.new(0.25, -4, 1, 0),
+        BackgroundColor3 = (fov == Config.aimFOV) and Colors.accent or Colors.panel,
+        Text = tostring(fov),
+        TextColor3 = Colors.text,
+        TextSize = 12,
+        Font = Enum.Font.GothamMedium
+    }, fovHolder)
+    Corner(b, 5)
+    fovButtons[i] = b
+    b.MouseButton1Click:Connect(function()
+        Config.aimFOV = fov
+        for j, btn in ipairs(fovButtons) do
+            btn.BackgroundColor3 = (j == i) and Colors.accent or Colors.panel
+        end
+        saveSettings()
+    end)
+end
+
+MakeButton(SheriffPage, "Диагностика команд", 11, function()
+    scanTeams()
+    local msg = ""
+    if #teamList == 0 then
+        msg = "Команды не найдены"
+    else
+        for i, t in ipairs(teamList) do
+            msg = msg .. "T" .. i .. ": " .. t.name .. " (" .. t.count .. ")"
+            if i < #teamList then msg = msg .. " | " end
+        end
+    end
+    local tool = LP.Character and LP.Character:FindFirstChildOfClass("Tool")
+    msg = msg .. " | Tool: " .. (tool and tool.Name or "нет")
+    Notify("Диагностика", msg)
+    LOG("DIAG: " .. msg)
+end, Color3.fromRGB(100, 60, 180))
+
+-- ===========================================================
+-- ВКЛАДКА 3: UNIVERSAL
+-- ===========================================================
+local UniversalPage = Pages[3]
+
+MakeLabel(UniversalPage, "Команда для подсветки:", 1)
+
+local espTeamHolder = Create("Frame", {
+    Size = UDim2.new(1, 0, 0, 34),
+    BackgroundTransparency = 1,
+    LayoutOrder = 2
+}, UniversalPage)
+Create("UIListLayout", {
+    FillDirection = Enum.FillDirection.Horizontal,
+    Padding = UDim.new(0, 5)
+}, espTeamHolder)
+
+local espT1 = Create("TextButton", {
+    Size = UDim2.new(0.33, -3, 1, 0),
+    Text = "Team 1",
+    TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.GothamBold,
+    TextSize = 12
+}, espTeamHolder)
+Corner(espT1)
+
+local espT2 = Create("TextButton", {
+    Size = UDim2.new(0.33, -3, 1, 0),
+    Text = "Team 2",
+    TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.GothamBold,
+    TextSize = 12
+}, espTeamHolder)
+Corner(espT2)
+
+local espTAll = Create("TextButton", {
+    Size = UDim2.new(0.33, -3, 1, 0),
+    Text = "Все",
+    TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.GothamBold,
+    TextSize = 12
+}, espTeamHolder)
+Corner(espTAll)
+
+local function refreshEspTeam(s)
+    Config.espTeam = s
+    espT1.BackgroundColor3 = (s == 1) and Colors.accent or Color3.fromRGB(50, 50, 60)
+    espT2.BackgroundColor3 = (s == 2) and Colors.accent or Color3.fromRGB(50, 50, 60)
+    espTAll.BackgroundColor3 = (s == 3) and Colors.accent or Color3.fromRGB(50, 50, 60)
+end
+espT1.MouseButton1Click:Connect(function() refreshEspTeam(1) end)
+espT2.MouseButton1Click:Connect(function() refreshEspTeam(2) end)
+espTAll.MouseButton1Click:Connect(function() refreshEspTeam(3) end)
+refreshEspTeam(Config.espTeam or 1)
+
+MakeLabel(UniversalPage, "Цвет подсветки:", 3)
+local colorHolder = Create("Frame", {
+    Size = UDim2.new(1, 0, 0, 34),
+    BackgroundTransparency = 1,
+    LayoutOrder = 4
+}, UniversalPage)
+Create("UIListLayout", {
+    FillDirection = Enum.FillDirection.Horizontal,
+    Padding = UDim.new(0, 4)
+}, colorHolder)
+
+local colorOptions = {
+    {name = "КР", color = Color3.fromRGB(255, 60, 60), rainbow = false},
+    {name = "ЗЕ", color = Color3.fromRGB(60, 255, 100), rainbow = false},
+    {name = "СИ", color = Color3.fromRGB(60, 140, 255), rainbow = false},
+    {name = "РО", color = Color3.fromRGB(255, 100, 220), rainbow = false},
+    {name = "РД", color = Color3.fromRGB(255, 200, 60), rainbow = true}
+}
+for i, opt in ipairs(colorOptions) do
+    local btn = Create("TextButton", {
+        Size = UDim2.new(0.19, -2, 1, 0),
+        BackgroundColor3 = opt.color,
+        Text = opt.name,
+        TextColor3 = Color3.new(0, 0, 0),
+        TextSize = 11,
+        Font = Enum.Font.GothamBold,
+        LayoutOrder = i
+    }, colorHolder)
+    Corner(btn, 5)
+    btn.MouseButton1Click:Connect(function()
+        if opt.rainbow then
+            Config.espRainbow = true
+        else
+            Config.espRainbow = false
+            Config.espColor = opt.color
+        end
+        saveSettings()
+    end)
+end
+
+local espBtn = MakeToggle(UniversalPage, "ESP", 5,
+    function() return Config.espEnabled end,
+    function(v) Config.espEnabled = v end,
+    Colors.on
+)
+
+local rbBtn = MakeToggle(UniversalPage, "Радуга", 6,
+    function() return Config.espRainbow end,
+    function(v) Config.espRainbow = v end,
+    Colors.rainbow
+)
+
+local statusLabel = Create("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 24),
+    BackgroundColor3 = Color3.fromRGB(30, 30, 40),
+    Text = "",
+    TextColor3 = Color3.fromRGB(150, 255, 150),
+    TextSize = 12,
+    Font = Enum.Font.GothamBold,
+    LayoutOrder = 7
+}, UniversalPage)
+Corner(statusLabel, 5)
+
+task.spawn(function()
+    while ScreenGui.Parent do
+        task.wait(0.5)
+        pcall(function()
+            local s = "ESP:" .. (Config.espEnabled and "ON" or "OFF")
+            s = s .. " | Радуга:" .. (Config.espRainbow and "ON" or "OFF")
+            if Config.espTeam == 3 then
+                s = s .. " | Все"
+            else
+                s = s .. " | T" .. Config.espTeam
+            end
+            statusLabel.Text = s
+        end)
+    end
+end)
+
+-- ===========================================================
+-- ЛОГИКА ESP
+-- ===========================================================
+local espCache = {}
+local espDirty = true
+
+local function clearHighlight(player)
+    local h = espCache[player]
+    if h then
+        pcall(function() h:Destroy() end)
+        espCache[player] = nil
+    end
+end
+
+local function applyHighlight(player)
+    if player == LP then return end
+    local char = player.Character
+    if not char then
+        clearHighlight(player)
+        return
+    end
+
+    local idx = getTeamIndex(player)
+    local shouldHighlight = false
+    if Config.espEnabled then
+        if Config.espTeam == 3 then
+            shouldHighlight = true
+        elseif idx == Config.espTeam then
+            shouldHighlight = true
+        end
+    end
+
+    if not shouldHighlight then
+        clearHighlight(player)
+        return
+    end
+
+    local h = espCache[player]
+    if not h or not h.Parent then
+        h = Instance.new("Highlight")
+        h.Name = "MVS_ESP"
+        h.DepthMode = Enum.HighlightDepthMode.Occluded
+        h.FillTransparency = 0.55
+        h.OutlineTransparency = 0.1
+        h.Parent = char
+        espCache[player] = h
+    end
+    h.Adornee = char
+    h.FillColor = Config.espColor
+    h.OutlineColor = Config.espColor
+end
+
+local function hookPlayer(player)
+    pcall(function()
+        player.CharacterAdded:Connect(function()
+            task.wait(0.4)
+            espDirty = true
+        end)
+        player.CharacterRemoving:Connect(function()
+            clearHighlight(player)
+        end)
+        player:GetAttributeChangedSignal("Team"):Connect(function()
+            task.wait(0.1)
+            espDirty = true
+        end)
+        player:GetPropertyChangedSignal("Team"):Connect(function()
+            task.wait(0.1)
+            espDirty = true
+        end)
+        player:GetPropertyChangedSignal("TeamColor"):Connect(function()
+            task.wait(0.1)
+            espDirty = true
+        end)
+    end)
+end
+
+for _, p in ipairs(Players:GetPlayers()) do hookPlayer(p) end
+Players.PlayerAdded:Connect(hookPlayer)
+Players.PlayerRemoving:Connect(clearHighlight)
+
+-- ===========================================================
+-- ЛОГИКА AIMBOT
+-- ===========================================================
+local function isVisible(targetChar, fromPart)
+    if not Config.wallCheck then return true end
+    if not targetChar or not fromPart then return false end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local exclude = {}
+    if LP.Character then exclude[1] = LP.Character end
+    params.FilterDescendantsInstances = exclude
+
+    for _, part in ipairs(targetChar:GetChildren()) do
+        if part:IsA("BasePart") then
+            local ray = workspace:Raycast(fromPart.Position, part.Position - fromPart.Position, params)
+            if ray and ray.Instance and ray.Instance:IsDescendantOf(targetChar) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function findAimTarget()
+    local myChar = LP.Character
+    if not myChar then return nil end
+    local myHead = myChar:FindFirstChild("Head") or myChar:FindFirstChild("HumanoidRootPart")
+    if not myHead then return nil end
+
+    local bestTarget = nil
+    local bestDist = math.huge
+    local screenCenter = Camera.ViewportSize / 2
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LP and player.Character then
+            if getTeamIndex(player) == Config.aimTeam then
+                local head = player.Character:FindFirstChild("Head")
+                local hum = player.Character:FindFirstChildOfClass("Humanoid")
+                if head and hum and hum.Health > 0 then
+                    local screenPos, onScreen = Camera:WorldToViewportPoint(head.Position)
+                    if onScreen then
+                        local dist = (Vector2.new(screenPos.X, screenPos.Y) - screenCenter).Magnitude
+                        if dist <= Config.aimFOV and dist < bestDist then
+                            if isVisible(player.Character, myHead) then
+                                bestTarget = player
+                                bestDist = dist
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return bestTarget
+end
+
+-- ===========================================================
+-- ЛОГИКА WALLBANG
+-- ===========================================================
+local wallbangActive = false
+
+local function findWallbangTarget()
+    local lookVector = Camera.CFrame.LookVector
+    local cameraPos = Camera.CFrame.Position
+    local bestTarget = nil
+    local bestDot = 0.1
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LP and player.Character then
+            if getTeamIndex(player) == Config.aimTeam then
+                local hrp = player.Character:FindFirstChild("HumanoidRootPart")
+                local hum = player.Character:FindFirstChildOfClass("Humanoid")
+                if hrp and hum and hum.Health > 0 then
+                    local toTarget = hrp.Position - cameraPos
+                    if toTarget.Magnitude < 900 then
+                        local dot = toTarget.Unit:Dot(lookVector)
+                        if dot > bestDot then
+                            bestTarget = player
+                            bestDot = dot
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return bestTarget
+end
+
+local function doWallbang()
+    if wallbangActive then return end
+    if not Config.wallbangEnabled then return end
+
+    local target = findWallbangTarget()
+    if not target or not target.Character then return end
+
+    local tChar = target.Character
+    local tHRP = tChar:FindFirstChild("HumanoidRootPart")
+    if not tHRP then return end
+
+    local myTool = LP.Character and LP.Character:FindFirstChildOfClass("Tool")
+    if not myTool then
+        Notify("Wallbang", "Возьми оружие в руки")
+        return
+    end
+
+    wallbangActive = true
+    LOG("Wallbang: цель " .. target.Name)
+
+    local myChar = LP.Character
+    local myHRP = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not myHRP then
+        wallbangActive = false
+        return
+    end
+
+    local savedCF = myHRP.CFrame
+    local savedCollisions = {}
+
+    for _, part in ipairs(myChar:GetDescendants()) do
+        if part:IsA("BasePart") and part.CanCollide then
+            savedCollisions[part] = true
+            part.CanCollide = false
+        end
+    end
+
+    myHRP.CFrame = tHRP.CFrame * CFrame.new(0, 0, -4)
+    myHRP.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+    myHRP.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+
+    task.wait()
+    pcall(function() myTool:Activate() end)
+    task.wait(0.15)
+
+    pcall(function() myHRP.CFrame = savedCF end)
+
+    for part, _ in pairs(savedCollisions) do
+        pcall(function() part.CanCollide = true end)
+    end
+
+    LOG("Wallbang: завершено")
+    wallbangActive = false
+end
+
+local hookedTools = {}
+local function hookTool(tool)
+    if hookedTools[tool] then return end
+    hookedTools[tool] = true
+    pcall(function()
+        tool.Activated:Connect(function()
+            if Config.wallbangEnabled and not wallbangActive then
+                task.spawn(doWallbang)
+            end
+        end)
+    end)
+    pcall(function()
+        tool.TouchTap:Connect(function()
+            if Config.wallbangEnabled and not wallbangActive then
+                task.spawn(doWallbang)
+            end
+        end)
+    end)
+end
+
+local function checkCharacter(char)
+    char.ChildAdded:Connect(function(c)
+        if c:IsA("Tool") then
+            task.wait(0.1)
+            hookTool(c)
+        end
+    end)
+    for _, c in ipairs(char:GetChildren()) do
+        if c:IsA("Tool") then hookTool(c) end
+    end
+end
+
+if LP.Character then checkCharacter(LP.Character) end
+LP.CharacterAdded:Connect(function(char)
+    task.wait(0.5)
+    checkCharacter(char)
+end)
+
+-- ===========================================================
+-- ЛОГИКА SHIFTLOCK
+-- ===========================================================
+local shiftLockAlign = nil
+local shiftLockAttachment = nil
+
+local function updateShiftLock()
+    if not Config.shiftLockEnabled then
+        if shiftLockAlign then
+            pcall(function() shiftLockAlign:Destroy() end)
+            shiftLockAlign = nil
+        end
+        if shiftLockAttachment then
+            pcall(function() shiftLockAttachment:Destroy() end)
+            shiftLockAttachment = nil
+        end
+        return
+    end
+
+    local char = LP.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum then hum.AutoRotate = false end
+
+    if not shiftLockAttachment or not shiftLockAttachment.Parent then
+        shiftLockAttachment = Instance.new("Attachment")
+        shiftLockAttachment.Name = "MVS_TurnAttachment"
+        shiftLockAttachment.Parent = hrp
+    end
+
+    if not shiftLockAlign or not shiftLockAlign.Parent then
+        shiftLockAlign = Instance.new("AlignOrientation")
+        shiftLockAlign.Name = "MVS_ShiftLock"
+        shiftLockAlign.Attachment0 = shiftLockAttachment
+        shiftLockAlign.Mode = Enum.OrientationAlignmentMode.OneAttachment
+        shiftLockAlign.RigidityEnabled = false
+        shiftLockAlign.Responsiveness = 25
+        shiftLockAlign.MaxTorque = math.huge
+        shiftLockAlign.Enabled = true
+        shiftLockAlign.Parent = hrp
+    end
+
+    local look = Camera.CFrame.LookVector
+    local flat = Vector3.new(look.X, 0, look.Z)
+    if flat.Magnitude > 0.01 then
+        shiftLockAlign.CFrame = CFrame.lookAt(Vector3.zero, flat.Unit)
+    end
+end
+
+-- ===========================================================
+-- ГЛАВНЫЙ ЦИКЛ
+-- ===========================================================
+local lastEsp = 0
+local lastAim = 0
+local lastRainbow = 0
+local lastShiftLock = 0
+local lastTeams = 0
+local cachedAimTarget = nil
+
+RunService.Heartbeat:Connect(function()
+    local now = tick()
+
+    if espDirty or (now - lastEsp > 0.3) then
+        lastEsp = now
+        espDirty = false
+        for _, player in ipairs(Players:GetPlayers()) do
+            pcall(applyHighlight, player)
+        end
+    end
+
+    if Config.espRainbow and (now - lastRainbow > 0.1) then
+        lastRainbow = now
+        Config.espColor = Color3.fromHSV((now * 0.15) % 1, 1, 1)
+        espDirty = true
+    end
+
+    if Config.aimbotEnabled then
+        if now - lastAim > 0.05 then
+            lastAim = now
+            cachedAimTarget = findAimTarget()
+        end
+        local target = cachedAimTarget
+        if target and target.Character then
+            local head = target.Character:FindFirstChild("Head")
+            if head then
+                local cur = Camera.CFrame
+                Camera.CFrame = cur:Lerp(CFrame.new(cur.Position, head.Position), Config.aimSmoothing)
+            end
+            end
+    end
+
+    if Config.shiftLockEnabled and (now - lastShiftLock > 0.02) then
+        lastShiftLock = now
+        pcall(updateShiftLock)
+    end
+
+    if now - lastTeams > 5 then
+        lastTeams = now
+        pcall(scanTeams)
+    end
+end)
+
+-- ===========================================================
+-- ГОРЯЧИЕ КЛАВИШИ
+-- ===========================================================
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    pcall(function()
+        if input.KeyCode == Enum.KeyCode.RightShift then
+            Main.Visible = not Main.Visible
+            FloatBtn.Visible = not Main.Visible
+        end
+    end)
+end)
+
+-- ===========================================================
+-- ФИНАЛ
+-- ===========================================================
+_G.MVSLoaded = true
+Notify("MVS FFA (Fixed)", "Загружен успешно!")
+LOG("OK")
